@@ -1,0 +1,430 @@
+env.sh
+export INSTALL_REGISTRY_USERNAME=admin
+export INSTALL_REGISTRY_PASSWORD=Harbor12345
+export INSTALL_REGISTRY_HOSTNAME=harbor.labs.io
+export TAP_VERSION=1.3.0
+export INSTALL_REPO=tap-install
+export REGISTRY_CA_PATH=/etc/docker/certs.d/harbor.labs.io/ca.crt
+# ess 1.3
+#export INSTALL_BUNDLE=harbor.labs.io/tap-install/cluster-essentials-bundle@sha256:54bf611711923dccd7c7f10603c846782b90644d48f1cb570b43a082d18e23b9
+
+# ess 1.2
+export INSTALL_BUNDLE=harbor.labs.io/tap-install/cluster-essentials-bundle@sha256:e00f33b92d418f49b1af79f42cb13d6765f1c8c731f4528dfff8343af042dc3e
+export DEVELOPER_NAMESPACE=developer-ns
+
+source env.sh
+
+kubectl create clusterrolebinding default-tkg-admin-privileged-binding --clusterrole=psp:vmware-system-privileged --group=system:authenticated
+
+kubectl delete ns tap-install
+kubectl delete ns developer-ns
+kubectl create ns tap-install
+kubectl create ns developer-ns
+
+tanzu secret registry add tap-registry \
+  --username ${INSTALL_REGISTRY_USERNAME} --password ${INSTALL_REGISTRY_PASSWORD} \
+  --server ${INSTALL_REGISTRY_HOSTNAME} \
+  --export-to-all-namespaces --yes --namespace tap-install
+
+tanzu package repository add tanzu-tap-repository \
+  --url ${INSTALL_REGISTRY_HOSTNAME}/${INSTALL_REPO}/tap-packages:$TAP_VERSION \
+  --namespace tap-install
+
+tanzu package repository get tanzu-tap-repository --namespace tap-install
+
+tanzu package install tap -p tap.tanzu.vmware.com -v 1.2.1 --values-file tap-values-multi-cluster-tap-full.yml -n tap-install
+
+tanzu package installed list -A
+
+cat <<EOF >  tap-gui-viewer-service-account-rbac.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tap-gui
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: tap-gui
+  name: tap-gui-viewer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tap-gui-read-k8s
+subjects:
+- kind: ServiceAccount
+  namespace: tap-gui
+  name: tap-gui-viewer
+roleRef:
+  kind: ClusterRole
+  name: k8s-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-reader
+rules:
+- apiGroups: ['']
+  resources: ['pods', 'pods/log', 'services', 'configmaps']
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['apps']
+  resources: ['deployments', 'replicasets']
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['autoscaling']
+  resources: ['horizontalpodautoscalers']
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['networking.k8s.io']
+  resources: ['ingresses']
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['networking.internal.knative.dev']
+  resources: ['serverlessservices']
+  verbs: ['get', 'watch', 'list']
+- apiGroups: [ 'autoscaling.internal.knative.dev' ]
+  resources: [ 'podautoscalers' ]
+  verbs: [ 'get', 'watch', 'list' ]
+- apiGroups: ['serving.knative.dev']
+  resources:
+  - configurations
+  - revisions
+  - routes
+  - services
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['carto.run']
+  resources:
+  - clusterconfigtemplates
+  - clusterdeliveries
+  - clusterdeploymenttemplates
+  - clusterimagetemplates
+  - clusterruntemplates
+  - clustersourcetemplates
+  - clustersupplychains
+  - clustertemplates
+  - deliverables
+  - runnables
+  - workloads
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['source.toolkit.fluxcd.io']
+  resources:
+  - gitrepositories
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['conventions.apps.tanzu.vmware.com']
+  resources:
+  - podintents
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['kpack.io']
+  resources:
+  - images
+  - builds
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['scanning.apps.tanzu.vmware.com']
+  resources:
+  - sourcescans
+  - imagescans
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['tekton.dev']
+  resources:
+  - taskruns
+  - pipelineruns
+  verbs: ['get', 'watch', 'list']
+- apiGroups: ['kappctrl.k14s.io']
+  resources:
+  - apps
+EOF
+
+CA_CERT=$(kubectl get secret -n metadata-store ingress-cert -o json | jq -r ".data.\"ca.crt\"")
+AUTH_TOKEN=$(kubectl get secrets -n metadata-store -o jsonpath="{.items[?(@.metadata.annotations['kubernetes\.io/service-account\.name']=='metadata-store-read-write-client')].data.token}" | base64 -d)
+
+cat <<EOF >  store_ca.yaml
+---
+apiVersion: v1
+kind: Secret
+type: kubernetes.io/tls
+metadata:
+  name: store-ca-cert
+  namespace: metadata-store-secrets
+data:
+  ca.crt: $CA_CERT
+  tls.crt: ""
+  tls.key: ""
+EOF
+
+kubectl create ns metadata-store-secrets
+kubectl apply -f store_ca.yaml
+
+kubectl create secret generic store-auth-token --from-literal=auth_token=$AUTH_TOKEN -n metadata-store-secrets
+
+cat <<EOF > store_secrets_export.yaml
+---
+apiVersion: secretgen.carvel.dev/v1alpha1
+kind: SecretExport
+metadata:
+  name: store-ca-cert
+  namespace: metadata-store-secrets
+spec:
+  toNamespace: scan-link-system
+---
+apiVersion: secretgen.carvel.dev/v1alpha1
+kind: SecretExport
+metadata:
+  name: store-auth-token
+  namespace: metadata-store-secrets
+spec:
+  toNamespace: scan-link-system
+---
+apiVersion: secretgen.carvel.dev/v1alpha1
+kind: SecretExport
+metadata:
+  name: store-auth-token
+  namespace: metadata-store-secrets
+spec:
+  toNamespace: developer-ns
+---
+apiVersion: secretgen.carvel.dev/v1alpha1
+kind: SecretExport
+metadata:
+  name: store-ca-cert
+  namespace: metadata-store-secrets
+spec:
+  toNamespace: developer-ns
+EOF
+
+kubectl apply -f store_secrets_export.yaml
+
+export WORKLOAD_REGISTRY_HOSTNAME=ccr.ccs.tencentyun.com
+export WORKLOAD_REGISTRY_USERNAME=100027819633
+export WORKLOAD_REGISTRY_PASSWORD=Ecdata2022
+export DEVELOPER_NAMESPACE=developer-ns
+
+tanzu secret registry add registry-credentials  -y --server $WORKLOAD_REGISTRY_HOSTNAME --username $WORKLOAD_REGISTRY_USERNAME --password $WORKLOAD_REGISTRY_PASSWORD --namespace $DEVELOPER_NAMESPACE
+
+cat <<EOF | kubectl -n developer-ns apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tap-registry
+  annotations:
+    secretgen.carvel.dev/image-pull-secret: ""
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: e30K
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+secrets:
+  - name: registry-credentials
+imagePullSecrets:
+  - name: registry-credentials
+  - name: tap-registry
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: default-permit-deliverable
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: deliverable
+subjects:
+  - kind: ServiceAccount
+    name: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: default-permit-workload
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: workload
+subjects:
+  - kind: ServiceAccount
+    name: default
+EOF
+
+cat <<EOF > github-secret-https.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: git-https
+  namespace: developer-ns
+  annotations:
+    tekton.dev/git-0: http://gitlab.labs.io:3000
+type: kubernetes.io/basic-auth
+stringData:
+  username: xsilver
+  password: Zhigang1978
+EOF
+
+kubectl apply -f github-secret-https.yaml
+
+cat <<EOF > metadata-rw-client.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metadata-store-read-write
+  namespace: metadata-store
+rules:
+- resources: ["all"]
+  verbs: ["get", "create", "update"]
+  apiGroups: [ "metadata-store/v1" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metadata-store-read-write
+  namespace: metadata-store
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: metadata-store-read-write
+subjects:
+- kind: ServiceAccount
+  name: metadata-store-read-write-client
+  namespace: metadata-store
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metadata-store-read-write-client
+  namespace: metadata-store
+automountServiceAccountToken: false
+EOF
+
+ kubectl apply -f metadata-rw-client.yaml
+
+kubectl get secret $(kubectl get sa -n metadata-store metadata-store-read-write-client -o json | jq -r '.secrets[0].name') -n metadata-store -o json | jq -r '.data.token' | base64 -d
+
+更新到value.yaml文件中
+
+cat <<EOF > snyk-secret.yaml
+---
+apiVersion: v1
+data:
+  snyk_token: MGM0MjRmYjQtYWZlNC00ZmEyLTg2ZjktYTVkNjcyZWEyMjVlCg==
+kind: Secret
+metadata:
+  name: snyk-api-token
+  namespace: developer-ns
+type: Opaque
+EOF
+kubectl apply -f  snyk-secret.yaml 
+
+cat <<EOF > snyk-values.yaml
+---
+namespace: developer-ns
+targetImagePullSecret: tap-registry
+snyk:
+  tokenSecret:
+    name: snyk-api-token
+metadataStore:
+  url: https://metadata-store.tap-mc.labs.io
+  caSecret:
+    name: store-ca-cert
+    importFromNamespace: "" #! since both snyk and grype both enable store, one must leave importFromNamespace blank
+  authSecret:
+    name: store-auth-token
+    importFromNamespace: "" #! since both snyk and grype both enable store, one must leave importFromNamespace blank
+EOF
+
+tanzu package available list snyk.scanning.apps.tanzu.vmware.com --namespace tap-install
+拿到snyk 版本号
+tanzu package install snyk-scanner \
+  --package-name snyk.scanning.apps.tanzu.vmware.com \
+  --version 1.0.0-beta.2 \
+  --namespace tap-install \
+  --values-file snyk-values.yaml
+
+cat <<EOF > scan-policy.yaml
+---
+apiVersion: scanning.apps.tanzu.vmware.com/v1beta1
+kind: ScanPolicy
+metadata:
+  name: scan-policy
+  namespace: developer-ns
+spec:
+  regoFile: |
+    package main
+
+    # Accepted Values: "Critical", "High", "Medium", "Low", "Negligible", "UnknownSeverity"
+    notAllowedSeverities := ["Critical","UnknownSeverity"]
+    ignoreCves := []
+
+    contains(array, elem) = true {
+      array[_] = elem
+    } else = false { true }
+
+    isSafe(match) {
+      fails := contains(notAllowedSeverities, match.ratings.rating[_])
+      not fails
+    }
+
+    isSafe(match) {
+      ignore := contains(ignoreCves, match.Id)
+      ignore
+    }
+
+    deny[msg] {
+      comp := input.bom.components.component[_]
+      vuln := comp.vulnerabilities.vulnerability[_]
+      ratings := vuln.ratings.rating[_]
+      not isSafe(vuln)
+      msg = sprintf("CVE %s %s %s", [comp.name, vuln.id, ratings])
+    }
+EOF
+
+kubectl apply -f scan-policy.yaml
+
+ cat <<EOF > tekton-pipeline.yaml
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: developer-defined-tekton-pipeline
+  namespace: developer-ns
+  labels:
+    apps.tanzu.vmware.com/pipeline: test      # (!) required
+spec:
+  params:
+    - name: source-url                        # (!) required
+    - name: source-revision                   # (!) required
+  tasks:
+    - name: test
+      params:
+        - name: source-url
+          value: $(params.source-url)
+        - name: source-revision
+          value: $(params.source-revision)
+      taskSpec:
+        params:
+          - name: source-url
+          - name: source-revision
+        steps:
+          - name: test
+            image: harbor.labs.io/tap/lib/maven:3.6.3-openjdk-11
+            script: |-
+              cd `mktemp -d`
+              wget -qO- $(params.source-url) | tar xvz -m
+              mvn test
+EOF
+
+kubectl apply -f tekton-pipeline.yaml
+
+kubectl edit sa default -n developer-ns
+把git-https加到secret那里
+
+tanzu package installed update tap -p tap.tanzu.vmware.com -v 1.2.1  --values-file tap-values-multi-cluster-tap-full.yml -n tap-install
+
+tanzu package installed list -A
+
+
+//测试
+tanzu apps workload create tanzu-java-web-app --git-repo http://gitlab.labs.io:3000/xsilver/tanzu-java-web-dev  --git-branch main --type web --label app.kubernetes.io/part-of=tanzu-java-web-app --label  apps.tanzu.vmware.com/has-tests=true --yes --namespace developer-ns
+
+tanzu apps workload tail tanzu-java-web-app --namespace developer-ns
+tanzu apps workload get tanzu-java-web-app --namespace developer-ns
+tanzu apps workload delete tanzu-java-web-app --yes --namespace developer-ns
+
+
