@@ -1,5 +1,44 @@
 tap-130
 
+//https证书  参考harbor文档  https://goharbor.io/docs/2.5.0/install-config/configure-https/
+
+//Generate a Certificate Authority Certificate
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -nodes -sha512 -days 3650 \
+ -subj "/C=CN/ST=Shanghai/L=Shanghai/O=example/OU=Personal/CN=harbor.labs.io" \
+ -key ca.key \
+ -out ca.crt
+
+//Generate a Server Certificate
+
+openssl genrsa -out harbor.labs.io.key 4096
+openssl req -sha512 -new \
+    -subj "/C=CN/ST=Shanghai/L=Shanghai/O=example/OU=Personal/CN=harbor.labs.io" \
+    -key harbor.labs.io.key \
+    -out harbor.labs.io.csr
+
+cat > v3.ext <<-EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1=harbor.labs.io
+DNS.2=labs.io
+DNS.3=harbor
+EOF
+
+openssl x509 -req -sha512 -days 3650 \
+    -extfile v3.ext \
+    -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -in harbor.labs.io.csr \
+    -out harbor.labs.io.crt
+
+openssl x509 -inform PEM -in harbor.labs.io.crt -out harbor.labs.io.cert
+
+
 export INSTALL_REGISTRY_USERNAME=admin
 export INSTALL_REGISTRY_PASSWORD=Harbor12345
 export INSTALL_REGISTRY_HOSTNAME=harbor.labs.io
@@ -401,7 +440,56 @@ tanzu package install snyk-scanner \
   --values-file snyk-values.yaml
 
 kubectl create configmap harbor-ca-cert --from-file=/data/bak/ca.crt -n developer-ns
-kubectl create configmap apache-ca-cert --from-file=/data/tap/tls/server.crt -n developer-ns
+kubectl create configmap apache-ca-cert --from-file=/data/tap/tls/ssl/ca.crt -n developer-ns
+
+cat <<EOF > grype-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grype-airgap-overlay
+  namespace: tap-install #! namespace where tap is installed
+stringData:
+  patch.yaml: |
+    #@ load("@ytt:overlay", "overlay")
+    #@overlay/match by=overlay.subset({"kind":"ScanTemplate"}),expects="1+"
+    ---
+    spec:
+      template:
+        initContainers:
+          #@overlay/match by=overlay.subset({"name": "scan-plugin"}), expects="1+"
+          - name: scan-plugin
+            #@overlay/match missing_ok=True
+            env:
+              #@overlay/append
+              - name: GRYPE_CHECK_FOR_APP_UPDATE
+                value: "false"
+              - name: GRYPE_DB_AUTO_UPDATE
+                value: "true"
+              - name: GRYPE_DB_UPDATE_URL
+                value: "https://harbor.labs.io:9443/listing.json" #! url points to the internal file server
+              - name: GRYPE_DB_CA_CERT
+                value: "/etc/ssl/certs/apache-ca-cert.crt"
+              - name: GRYPE_DB_MAX_ALLOWED_BUILT_AGE
+                value: "24000h"
+            volumeMounts:
+              #@overlay/append
+              - name: harbor-ca-cert
+                mountPath: /etc/ssl/certs/harbor-ca-cert.crt
+                subPath: ca.crt #! key pointing to ca certificate
+              - name: apache-ca-cert
+                mountPath: /etc/ssl/certs/apache-ca-cert.crt
+                subPath: ca.crt #! key pointing to ca certificate
+        volumes:
+        #@overlay/append
+        - name: harbor-ca-cert
+          configMap:
+            name: harbor-ca-cert #! name of the configmap created
+        - name: apache-ca-cert
+          configMap:
+            name: apache-ca-cert #! name of the configmap created
+EOF
+
+kubectl apply -f  grype-secret.yaml 
 
 cat <<EOF > scan-policy.yaml
 ---
@@ -500,3 +588,29 @@ tanzu package installed delete tap --yes --namespace tap-install
 
 tanzu package repository delete  tanzu-tap-repository  --yes --namespace tap-install
 tanzu package repository delete  tbs-full-deps-repository  --yes --namespace tap-install
+
+kubectl delete ns tap-install
+kubectl delete ns developer-ns --force --grace-period=0
+kubectl delete ns metadata-store-secrets
+
+//ns 删除不掉
+kubectl get ns developer-ns  -o json >developer-ns.json
+
+vi  developer-ns.json
+修改：
+"spec": {
+        "finalizers": [
+            "kubernetes"
+        ]
+    },
+为：
+"spec": {
+        "finalizers": [
+        ]
+    },
+
+kubectl proxy --port=8082
+curl -k -H "Content-Type:application/json" -X PUT --data-binary @developer-ns.json http://127.0.0.1:8082/api/v1/namespaces/developer-ns/finalize
+
+
+tanzu package installed list -A
